@@ -2,6 +2,7 @@ import os
 import signal
 import subprocess
 import time
+import atexit
 from threading import Lock
 
 import psutil
@@ -10,13 +11,14 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# =========================================
+# =========================================================
 # CONFIG
-# =========================================
+# =========================================================
 
 LLAMA_SERVER_PATH = "/home/pi/llama.cpp/build/bin/llama-server"
 
 MODELS = {
+
     "tinyllama": {
         "path": "/home/pi/llama.cpp/models/tinyllama.gguf",
         "ctx": 192,
@@ -26,20 +28,21 @@ MODELS = {
     },
 
     "qwen-coder": {
-        "path": "/home/pi/llama.cpp/models/qwen-coder.gguf",
+        "path": "/home/pi/llama.cpp/models/qwen_coder_0_5b.gguf",
         "ctx": 192,
         "temp": 0.1,
         "top_p": 0.8,
         "threads": 3,
     },
 
-    "dolphin": {
-        "path": "/home/pi/llama.cpp/models/dolphin.gguf",
+    "qwen1.5b": {
+        "path": "/home/pi/llama.cpp/models/qwen1_5b.gguf",
         "ctx": 128,
-        "temp": 0.7,
-        "top_p": 0.95,
+        "temp": 0.1,
+        "top_p": 0.8,
         "threads": 3,
-    },
+    }
+
 }
 
 LLAMA_PORT = 8080
@@ -49,9 +52,9 @@ current_model = None
 llama_process = None
 lock = Lock()
 
-# =========================================
+# =========================================================
 # HELPERS
-# =========================================
+# =========================================================
 
 def kill_server():
     global llama_process
@@ -66,7 +69,7 @@ def kill_server():
             except:
                 pass
 
-    # cleanup stray processes
+    # cleanup stray llama-server processes
     for proc in psutil.process_iter(['pid', 'cmdline']):
         try:
             cmdline = " ".join(proc.info["cmdline"])
@@ -78,11 +81,14 @@ def kill_server():
             pass
 
     llama_process = None
+
     time.sleep(2)
 
 
 def wait_for_server():
+
     for _ in range(30):
+
         try:
             r = requests.get(
                 f"http://127.0.0.1:{LLAMA_PORT}/health",
@@ -101,6 +107,7 @@ def wait_for_server():
 
 
 def start_model(model_name):
+
     global current_model
     global llama_process
 
@@ -109,46 +116,69 @@ def start_model(model_name):
 
     config = MODELS[model_name]
 
+    print(f"\nLoading model: {model_name}")
+
     kill_server()
 
     cmd = [
+
         LLAMA_SERVER_PATH,
 
         "-m", config["path"],
+
         "-c", str(config["ctx"]),
+
         "-t", str(config["threads"]),
 
         "--host", "0.0.0.0",
+
         "--port", str(LLAMA_PORT),
 
         "--temp", str(config["temp"]),
+
         "--top-p", str(config["top_p"]),
 
         "-ngl", "0"
+
     ]
 
-    llama_process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    print("\nStarting llama-server...\n")
+
+    try:
+
+        llama_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    except Exception as e:
+        return False, str(e)
 
     ok = wait_for_server()
 
     if not ok:
-        return False, "server failed to start"
+
+        try:
+            stderr_output = llama_process.stderr.read()
+        except:
+            stderr_output = "unknown error"
+
+        return False, stderr_output
 
     current_model = model_name
 
     return True, "started"
 
 
-# =========================================
-# API
-# =========================================
+# =========================================================
+# API ROUTES
+# =========================================================
 
 @app.route("/")
 def home():
+
     return jsonify({
         "service": "Pi Edge LLM Orchestrator",
         "current_model": current_model,
@@ -157,6 +187,7 @@ def home():
 
 @app.route("/models")
 def models():
+
     return jsonify({
         "models": list(MODELS.keys())
     })
@@ -168,6 +199,7 @@ def load_model():
     data = request.json
 
     if not data or "model" not in data:
+
         return jsonify({
             "error": "missing model"
         }), 400
@@ -178,6 +210,7 @@ def load_model():
         ok, msg = start_model(model_name)
 
     if not ok:
+
         return jsonify({
             "success": False,
             "message": msg
@@ -197,6 +230,7 @@ def status():
     temp = "unknown"
 
     try:
+
         temp = subprocess.check_output(
             ["vcgencmd", "measure_temp"]
         ).decode().strip()
@@ -205,11 +239,17 @@ def status():
         pass
 
     return jsonify({
+
         "current_model": current_model,
+
         "ram_percent": ram.percent,
+
         "ram_used_mb": round(ram.used / 1024 / 1024),
+
         "cpu_percent": psutil.cpu_percent(),
+
         "temp": temp,
+
     })
 
 
@@ -217,11 +257,13 @@ def status():
 def chat():
 
     if not current_model:
+
         return jsonify({
             "error": "no model loaded"
         }), 400
 
     try:
+
         payload = request.json
 
         r = requests.post(
@@ -233,6 +275,7 @@ def chat():
         return jsonify(r.json())
 
     except Exception as e:
+
         return jsonify({
             "error": str(e)
         }), 500
@@ -244,29 +287,42 @@ def unload():
     global current_model
 
     with lock:
+
         kill_server()
+
         current_model = None
 
     return jsonify({
-        "success": True
+        "success": True,
+        "message": "model unloaded"
     })
 
 
-# =========================================
+# =========================================================
+# CLEANUP
+# =========================================================
+
+atexit.register(kill_server)
+
+# =========================================================
 # MAIN
-# =========================================
+# =========================================================
 
 if __name__ == "__main__":
 
-    print("\nPi Edge LLM Orchestrator")
-    print("----------------------------")
+    print("\n======================================")
+    print("Pi Edge LLM Orchestrator")
+    print("======================================")
 
-    print("Available models:")
+    print("\nAvailable models:\n")
 
     for m in MODELS:
         print("-", m)
 
-    print(f"\nAPI running on port {API_PORT}\n")
+    print(f"\nAPI running on port {API_PORT}")
+    print(f"llama.cpp server port: {LLAMA_PORT}")
+
+    print("\nReady.\n")
 
     app.run(
         host="0.0.0.0",
